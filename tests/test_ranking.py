@@ -11,7 +11,11 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tokenizer import tokenize
-from ranking import bm25, search, expand_aliases, load_aliases, W_HEAD, W_POS, W_TYPE, K1, B
+from ranking import (
+    bm25, weighted_bm25, search, expand_aliases, load_aliases,
+    W_FIELD_LEAF, W_FIELD_ANCESTOR, COVERAGE_POWER, W_POS, W_TYPE, K1, B,
+    CUTOFF_DROP_RATIO, CUTOFF_DEFAULT_TOPK, _apply_cliff_cutoff,
+)
 
 
 # ─── Fixture ─────────────────────────────────────────────────────────────────
@@ -25,6 +29,8 @@ def _make_chunk(chunk_id, file, heading, heading_path, text, ctype, position):
     combined = text_tokens + heading_tokens_list
     tf = dict(Counter(combined))
     dl = sum(tf.values())
+    path_parts = heading_path.split(' > ') if heading_path else []
+    ancestor_text = ' '.join(path_parts[:-1])
     return {
         'id': chunk_id,
         'file': file,
@@ -36,6 +42,7 @@ def _make_chunk(chunk_id, file, heading, heading_path, text, ctype, position):
         'tf': tf,
         'dl': dl,
         'heading_tokens': set(heading_tokens_list),
+        'ancestor_heading_tokens': set(tokenize(ancestor_text, **_CFG)),
     }
 
 
@@ -197,11 +204,14 @@ def test_search_unknown_query_returns_empty():
 
 
 def test_search_heading_bonus_applied():
-    """标题包含查询词的 chunk 获得额外加分（score 比同 BM25 的普通块高）。"""
+    """叶子标题命中查询词时，加权 BM25 应是纯文本 BM25 的 W_FIELD_LEAF 倍。"""
     qtokens = list(dict.fromkeys(tokenize('admm', **_CFG)))
-    score0 = bm25(_INDEX, _CHUNKS[0], qtokens) + W_HEAD * 1.0 + W_POS / (1.0 + 0)
-    score3 = bm25(_INDEX, _CHUNKS[3], qtokens)  # 不含 admm，BM25=0
-    assert score0 > score3
+    plain = bm25(_INDEX, _CHUNKS[0], qtokens)
+    weighted = weighted_bm25(_INDEX, _CHUNKS[0], qtokens)
+    assert plain > 0, "前提：admm 应在该块中有正向 BM25 贡献"
+    assert abs(weighted - plain * W_FIELD_LEAF) < 1e-9, (
+        f"加权应为 {plain * W_FIELD_LEAF}，实际 {weighted}"
+    )
 
 
 def test_search_position_bonus_monotone():
@@ -209,6 +219,135 @@ def test_search_position_bonus_monotone():
     pos_bonus_0 = W_POS / (1.0 + 0)
     pos_bonus_1 = W_POS / (1.0 + 1)
     assert pos_bonus_0 > pos_bonus_1
+
+
+def test_search_ancestor_heading_bonus_weaker_than_leaf():
+    """祖先标题（非叶子）命中查询词时，加权倍数弱于叶子标题命中。"""
+    chunk = _make_chunk(
+        0, 'f.md', '应用案例', 'ADMM > 应用案例',
+        'admm 在工程实践中有广泛应用，这里讨论一些应用案例的细节。',
+        'prose', 3,
+    )
+    index = _build_test_index([chunk])  # 单独建索引，避免被其他高分块在断崖截断中挤掉
+    qtokens = list(dict.fromkeys(tokenize('admm', **_CFG)))
+    plain = bm25(index, chunk, qtokens)
+    weighted = weighted_bm25(index, chunk, qtokens)
+
+    assert abs(weighted - plain * W_FIELD_ANCESTOR) < 1e-9, (
+        f"祖先标题加权应为 {plain * W_FIELD_ANCESTOR}，实际 {weighted}"
+    )
+    assert W_FIELD_ANCESTOR < W_FIELD_LEAF, "祖先标题加权应弱于叶子标题"
+
+    results, _ = search(index, 'admm', aliases=None)
+    target = next(r for r in results if r['file'] == 'f.md')
+    pos_bonus = W_POS / (1.0 + 3)
+    expected = weighted + pos_bonus  # intent=None 时 type_bonus=0，n_topics=1 时 coverage_factor=1
+    assert abs(target['score'] - expected) < 1e-9, (
+        f"search() 总分与预期不符：实际 {target['score']}，期望 {expected}"
+    )
+
+
+def test_search_exact_heading_match_outranks_repeated_mentions():
+    """标题与查询基本等价的短块，应跑赢正文里反复提及该词但标题无关的长块。"""
+    exact_chunk = _make_chunk(
+        0, 'g.md', '凸优化', '方法 > 凸优化',
+        '凸优化是指目标函数和约束集均为凸的优化问题。',
+        'prose', 0,
+    )
+    long_text = ('凸优化 ' * 40) + '这个概念在很多场景中都会被反复提及，但本节标题与之无关。'
+    noisy_chunk = _make_chunk(
+        1, 'h.md', '杂项笔记', '其他 > 杂项笔记',
+        long_text, 'prose', 0,
+    )
+    # 补足若干不含该词的填充块，拉高 idf，模拟更大语料下的压力场景
+    filler_chunks = [
+        _make_chunk(2 + i, f'filler{i}.md', f'填充章节{i}', f'填充 > 填充章节{i}',
+                    f'这是与凸性无关的第 {i} 段填充文字，用于撑大语料规模。',
+                    'prose', 0)
+        for i in range(8)
+    ]
+    index = _build_test_index([exact_chunk, noisy_chunk] + filler_chunks)
+
+    results, _ = search(index, '凸优化', aliases=None)
+    assert results, "期望有结果"
+    assert results[0]['file'] == 'g.md', (
+        f"标题精确匹配的块应排第 1，实际排序: {[r['file'] for r in results]}"
+    )
+
+
+def test_search_fuzzy_heading_partial_match_still_boosted():
+    """标题只包含查询词的一部分（模糊匹配，非精确等价）也应获得比无标题命中更高的分。"""
+    partial_chunk = _make_chunk(
+        0, 'p.md', 'ADMM 工程实践要点', 'ADMM > ADMM 工程实践要点',
+        'admm 在实际工程中常配合 warm start 使用。', 'prose', 0,
+    )
+    no_heading_chunk = _make_chunk(
+        1, 'q.md', '杂项笔记', '其他 > 杂项笔记',
+        'admm 在实际工程中常配合 warm start 使用。', 'prose', 0,
+    )
+    index = _build_test_index([partial_chunk, no_heading_chunk])
+    qtokens = list(dict.fromkeys(tokenize('admm', **_CFG)))
+    score_p = weighted_bm25(index, partial_chunk, qtokens)
+    score_q = weighted_bm25(index, no_heading_chunk, qtokens)
+    assert score_p > score_q, (
+        f"标题模糊命中（非精确等价）也应获得更高分：p={score_p}, q={score_q}"
+    )
+
+
+def test_coverage_factor_penalizes_single_term_dominance():
+    """多词查询下，只命中一个词但反复出现的块，应排在'多个词都沾边'的块之后。"""
+    topicful = _make_chunk(
+        0, 'topicful.md', '一致性ADMM分布式优化', '方法 > 一致性ADMM分布式优化',
+        '一致性优化问题中，ADMM 在分布式场景下交替更新变量直至收敛。',
+        'prose', 0,
+    )
+    admm_heavy = _make_chunk(
+        1, 'admmheavy.md', '其他算法说明', '杂项 > 其他算法说明',
+        ('ADMM ' * 50) + '反复提及但与一致性、分布式都无关。',
+        'prose', 0,
+    )
+    filler_chunks = [
+        _make_chunk(2 + i, f'filler{i}.md', f'填充{i}', f'填充 > 填充{i}',
+                    f'第 {i} 段与本次查询完全无关的填充内容。', 'prose', 0)
+        for i in range(8)
+    ]
+    index = _build_test_index([topicful, admm_heavy] + filler_chunks)
+
+    results, _ = search(index, '一致性 admm 分布式', aliases=None)
+    files = [r['file'] for r in results]
+    assert files, "期望有结果"
+    assert files[0] == 'topicful.md', (
+        f"多词都命中的块应排第 1，实际排序: {files}"
+    )
+
+
+# ─── 断崖截断（cliff cutoff）单元测试 ──────────────────────────────────────────
+
+def test_cliff_cutoff_keeps_close_scores():
+    """相邻名次分数跌幅不超过阈值时，全部保留。"""
+    results = [{'score': 10.0}, {'score': 6.0}, {'score': 5.9}]
+    kept = _apply_cliff_cutoff(results, drop_ratio=0.5)
+    assert len(kept) == 3, f"期望全部保留，实际 {kept}"
+
+
+def test_cliff_cutoff_drops_after_big_drop():
+    """出现跌破阈值的断崖时，断崖之后的结果被截断。"""
+    results = [{'score': 10.0}, {'score': 4.0}, {'score': 3.9}]
+    kept = _apply_cliff_cutoff(results, drop_ratio=0.5)
+    assert len(kept) == 1, f"期望只保留第 1 条，实际 {kept}"
+
+
+def test_cliff_cutoff_empty_list():
+    """空列表输入返回空列表。"""
+    assert _apply_cliff_cutoff([]) == []
+
+
+def test_cliff_cutoff_always_keeps_first():
+    """无论分数如何，至少保留第 1 条。"""
+    results = [{'score': 1.0}, {'score': 0.0001}]
+    kept = _apply_cliff_cutoff(results, drop_ratio=0.5)
+    assert len(kept) == 1
+    assert kept[0]['score'] == 1.0
 
 
 # ─── 意图识别测试（Task 1.1）──────────────────────────────────────────────────
@@ -385,6 +524,14 @@ if __name__ == '__main__':
         test_search_unknown_query_returns_empty,
         test_search_heading_bonus_applied,
         test_search_position_bonus_monotone,
+        test_search_ancestor_heading_bonus_weaker_than_leaf,
+        test_search_exact_heading_match_outranks_repeated_mentions,
+        test_search_fuzzy_heading_partial_match_still_boosted,
+        test_coverage_factor_penalizes_single_term_dominance,
+        test_cliff_cutoff_keeps_close_scores,
+        test_cliff_cutoff_drops_after_big_drop,
+        test_cliff_cutoff_empty_list,
+        test_cliff_cutoff_always_keeps_first,
         # 意图识别（Task 1.1）
         test_intent_prose_detected,
         test_intent_code_detected,

@@ -47,7 +47,11 @@ def _read_file(abs_path):
 
 
 def _make_chunk(raw, chunk_id, cfg):
-    """给 parser 产生的 chunk 雏形填充 tf/dl/heading_tokens/id。
+    """给 parser 产生的 chunk 雏形填充 tf/dl/heading_tokens/ancestor_heading_tokens/id。
+
+    heading_tokens 只含当前（叶子）标题的 token，参与 BM25 的 tf 与精确匹配判断；
+    ancestor_heading_tokens 含 heading_path 中所有祖先标题（不含叶子）的 token，
+    只用于较弱的"祖先标题命中"加分，不计入 tf（避免父标题词膨胀 BM25）。
 
     Returns:
         完整 chunk dict，或 None（若 dl == 0 则丢弃）。
@@ -59,11 +63,18 @@ def _make_chunk(raw, chunk_id, cfg):
     dl = sum(tf.values())
     if dl == 0:
         return None
+
+    # heading_path 形如 "祖先1 > 祖先2 > 叶子"；最后一段即叶子标题
+    path_parts = raw['heading_path'].split(' > ') if raw['heading_path'] else []
+    ancestor_text = ' '.join(path_parts[:-1])
+    ancestor_tokens = set(tokenize(ancestor_text, **cfg))
+
     chunk = dict(raw)
     chunk['id'] = chunk_id
     chunk['tf'] = tf
     chunk['dl'] = dl
     chunk['heading_tokens'] = set(heading_tokens_list)
+    chunk['ancestor_heading_tokens'] = ancestor_tokens
     return chunk
 
 

@@ -122,7 +122,7 @@ class SearchHandler(BaseHTTPRequestHandler):
         else:
             try:
                 results_list, intent = ranking.search(
-                    _INDEX, q, _ALIASES, type_filter=type_filter, topk=20
+                    _INDEX, q, _ALIASES, type_filter=type_filter
                 )
             except Exception as exc:
                 print(f"[错误] 检索失败: {exc}")

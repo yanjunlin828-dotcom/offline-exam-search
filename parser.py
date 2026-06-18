@@ -49,6 +49,11 @@ def _heading_path(stack):
     return ' > '.join(t for _, t in stack)
 
 
+def _heading_levels(stack):
+    """heading_path 每一段对应的真实 Markdown 标题级别（# 的个数）。"""
+    return [lvl for lvl, _ in stack]
+
+
 def _current_heading(stack):
     return stack[-1][1] if stack else ''
 
@@ -68,6 +73,7 @@ def _flush_prose_lines(prose_lines, file, heading_stack, position):
                 'file': file,
                 'heading': _current_heading(heading_stack),
                 'heading_path': _heading_path(heading_stack),
+                'heading_levels': _heading_levels(heading_stack),
                 'text': block,
                 'ctype': 'prose',
                 'position': position,
@@ -109,6 +115,7 @@ def _flush_fence(state, file, chunks):
             'file': file,
             'heading': _current_heading(state['heading_stack']),
             'heading_path': _heading_path(state['heading_stack']),
+            'heading_levels': _heading_levels(state['heading_stack']),
             'text': block,
             'ctype': 'code',
             'position': state['position'],

@@ -1,20 +1,39 @@
 """
-相关度计算：BM25 + 标题加分 + 位置加分 + 意图加分（P1）+ 别名展开（P1）。
+相关度计算：字段加权 BM25 + 覆盖率惩罚 + 位置加分 + 意图加分（P1）+ 别名展开（P1）。
 """
 
 import math
 import os
 from tokenizer import tokenize
 
-W_HEAD = 2.0   # 标题命中加分权重
+W_FIELD_LEAF = 6.0      # query token 命中叶子标题时，该 token 的 BM25 贡献乘数
+W_FIELD_ANCESTOR = 2.5  # query token 命中祖先标题（章节/单元标题）时的乘数，弱于叶子
+COVERAGE_POWER = 2      # 覆盖率惩罚指数：命中的不同 query token 越少，分数被压得越狠
 W_TYPE = 1.5   # 类型匹配加分权重
 W_POS  = 0.5   # 位置加分权重（越靠近标题越高）
 K1 = 1.5       # BM25 词频饱和参数
 B  = 0.75      # BM25 文档长度归一化参数
+CUTOFF_DROP_RATIO = 0.5  # 结果断崖检测：相邻名次分数跌破上一名的这个比例就截断
+CUTOFF_DEFAULT_TOPK = 10  # 默认返回条数上限（断崖检测在这个窗口内生效）
+
+
+def _token_term(index, chunk, t, boost=1.0):
+    """单个 token 对该 chunk 的 BM25 贡献（含字段权重 boost）。"""
+    avgdl = index['avgdl']
+    if avgdl == 0:
+        return 0.0
+    tf = chunk['tf'].get(t, 0)
+    if tf == 0:
+        return 0.0
+    N = index['N']
+    df_t = index['df'].get(t, 0)
+    idf = math.log(1.0 + (N - df_t + 0.5) / (df_t + 0.5))
+    dl = chunk['dl']
+    return boost * idf * tf * (K1 + 1) / (tf + K1 * (1.0 - B + B * dl / avgdl))
 
 
 def bm25(index, chunk, qtokens):
-    """计算单个 chunk 对查询 token 列表的 BM25 分数。
+    """计算单个 chunk 对查询 token 列表的 BM25 分数（不含字段权重，纯文本）。
 
     使用 Lucene 式 IDF：ln(1 + (N - df + 0.5) / (df + 0.5))，避免常见词负 IDF。
 
@@ -26,23 +45,36 @@ def bm25(index, chunk, qtokens):
     Returns:
         float BM25 分数（>= 0）。
     """
-    N = index['N']
-    avgdl = index['avgdl']
-    df_table = index['df']
-    dl = chunk['dl']
-    tf_dict = chunk['tf']
+    return sum(_token_term(index, chunk, t) for t in qtokens)
 
-    if avgdl == 0:
-        return 0.0
+
+def weighted_bm25(index, chunk, qtokens):
+    """同 bm25，但命中标题/祖先标题的 token 按字段权重放大贡献。
+
+    不改变 chunk['dl']（文档长度归一化不受影响），只放大命中标题的 query token
+    在分子上的贡献——这样标题精确匹配和模糊匹配（标题只包含查询词的一部分）
+    都能连续地获得与匹配程度成比例的提升，不需要"是否精确匹配"的硬判断。
+
+    Args:
+        index: 完整索引 dict。
+        chunk: 单个 chunk dict（含 tf / dl / heading_tokens / ancestor_heading_tokens）。
+        qtokens: 查询 token 列表。
+
+    Returns:
+        float 加权 BM25 分数（>= 0）。
+    """
+    leaf_tokens = chunk.get('heading_tokens', frozenset())
+    ancestor_tokens = chunk.get('ancestor_heading_tokens', frozenset())
 
     score = 0.0
     for t in qtokens:
-        tf = tf_dict.get(t, 0)
-        if tf == 0:
-            continue
-        df_t = df_table.get(t, 0)
-        idf = math.log(1.0 + (N - df_t + 0.5) / (df_t + 0.5))
-        score += idf * tf * (K1 + 1) / (tf + K1 * (1.0 - B + B * dl / avgdl))
+        if t in leaf_tokens:
+            boost = W_FIELD_LEAF
+        elif t in ancestor_tokens:
+            boost = W_FIELD_ANCESTOR
+        else:
+            boost = 1.0
+        score += _token_term(index, chunk, t, boost)
 
     return score
 
@@ -151,18 +183,45 @@ def load_aliases(path):
     return groups
 
 
-def search(index, query, aliases, type_filter="all", topk=20):
-    """检索并按相关度返回 topk 结果。
+def _apply_cliff_cutoff(results, drop_ratio=CUTOFF_DROP_RATIO):
+    """从第 1 名开始扫描，一旦下一名分数跌破上一名的 drop_ratio 就截断。
 
-    打分 = BM25(score_tokens) + W_HEAD*(标题命中率) + W_POS*(1/(1+pos)) + W_TYPE*(意图匹配)
+    保底返回至少第 1 条（若 results 非空）。
+
+    Args:
+        results: 已按 score 降序排列的结果列表。
+        drop_ratio: 跌破上一名这个比例就截断（如 0.5 = 跌破一半）。
+
+    Returns:
+        截断后的结果列表（原列表的前缀）。
+    """
+    if not results:
+        return results
+    kept = [results[0]]
+    for r in results[1:]:
+        if r['score'] < kept[-1]['score'] * drop_ratio:
+            break
+        kept.append(r)
+    return kept
+
+
+def search(index, query, aliases, type_filter="all", topk=CUTOFF_DEFAULT_TOPK):
+    """检索并按相关度返回结果（先按 topk 截顶，再做断崖检测进一步收窄）。
+
+    打分 = (weighted_bm25(score_tokens) + W_POS*(1/(1+pos)) + W_TYPE*(意图匹配))
+           * coverage_factor
+    coverage_factor = (命中的不同 topic_token 数 / topic_token 总数) ** COVERAGE_POWER
     score_tokens = topic_tokens ∪ 该块完整命中的别名短语 token（部分命中不计分）。
+
+    coverage_factor 惩罚"只命中查询里一个词、但那个词出现次数很多"的块，
+    weighted_bm25 让标题/次标题命中（哪怕只是部分命中）天然获得更大权重。
 
     Args:
         index: pickle.load 得到的索引 dict。
         query: 原始查询字符串（含特殊字符也不报错）。
         aliases: 别名组列表（load_aliases 结果；None 或 [] 则跳过别名展开）。
         type_filter: "all" | "prose" | "code"。
-        topk: 最多返回条数。
+        topk: 断崖检测窗口的硬上限（最多返回这么多条，断崖检测可能进一步收窄）。
 
     Returns:
         (list[dict], intent)：
@@ -241,22 +300,24 @@ def search(index, query, aliases, type_filter="all", topk=20):
                     score_token_set.add(t)
         score_tokens = list(score_token_set)
 
-        bm25_score = bm25(index, chunk, score_tokens)
+        bm25_score = weighted_bm25(index, chunk, score_tokens)
 
-        # 标题加分：用 topic_tokens 衡量，别名 token 不膨胀此加分
-        heading_hit = sum(1 for t in topic_tokens if t in chunk['heading_tokens'])
-        head_bonus = W_HEAD * (heading_hit / n_topics)
+        # 覆盖率惩罚：用 topic_tokens（用户真正输入的概念词）衡量，
+        # 别名展开不影响覆盖率，避免"靠别名凑够覆盖率"绕过惩罚。
+        matched_topics = sum(1 for t in topic_tokens if chunk['tf'].get(t, 0) > 0)
+        coverage_factor = (matched_topics / n_topics) ** COVERAGE_POWER
 
         pos_bonus = W_POS * (1.0 / (1.0 + chunk['position']))
 
         # 意图加分：intent 与 ctype 匹配才加分（软偏好，不硬过滤）
         type_bonus = W_TYPE * (1 if intent and chunk['ctype'] == intent else 0)
 
-        final = bm25_score + head_bonus + pos_bonus + type_bonus
+        final = (bm25_score + pos_bonus + type_bonus) * coverage_factor
 
         results.append({
             'file': chunk['file'],
             'heading_path': chunk['heading_path'],
+            'heading_levels': chunk.get('heading_levels', []),
             'ctype': chunk['ctype'],
             'score': final,
             'text': chunk['text'],
@@ -264,4 +325,4 @@ def search(index, query, aliases, type_filter="all", topk=20):
         })
 
     results.sort(key=lambda x: x['score'], reverse=True)
-    return results[:topk], intent
+    return _apply_cliff_cutoff(results[:topk]), intent
