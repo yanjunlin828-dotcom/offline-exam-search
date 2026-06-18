@@ -35,7 +35,8 @@
 ├── aliases.txt         # 别名/同义词配置（每行一组，用 = 分隔）
 ├── web/                # 前端（index.html 搜索页 + viewer.html 全文查看页 + 打包的前端库）
 ├── tests/               # pytest 测试
-└── download_assets.ps1  # 在有网的机器上重新下载/更新 web/ 下的前端库（可选）
+├── docs/                # 截图、设计/方案文档（docs/design/，纯说明性内容，不影响运行）
+└── scripts/             # 维护用脚本（如 download_assets.ps1，可选）
 ```
 
 > `index.pkl`（索引缓存）和 `materials/`（你的原始笔记）默认被 `.gitignore` 排除，不会上传到仓库——这两个东西因人而异，换一份资料就要重新生成，没必要进版本库。
@@ -137,4 +138,4 @@ python -m pytest tests/ -q
 3. 把整个项目文件夹（含生成好的 `index.pkl`）复制进 U 盘
 4. 到考试机上插 U 盘，直接 `python server.py --materials <笔记目录> --port 8000`，无需联网、无需安装任何依赖
 
-`web/` 目录下的前端库（`marked.js`、`highlight.js`、`KaTeX`）已经打包进仓库，不会在运行时请求 CDN。如果想更新这些前端库版本，在**有网**的机器上运行 `download_assets.ps1` 重新下载即可。
+`web/` 目录下的前端库（`marked.js`、`highlight.js`、`KaTeX`）已经打包进仓库，不会在运行时请求 CDN。如果想更新这些前端库版本，在**有网**的机器上运行 `scripts/download_assets.ps1` 重新下载即可。
