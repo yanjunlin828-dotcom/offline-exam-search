@@ -1,0 +1,13 @@
+# 索引缓存 —— 因人而异，clone 后用 build_index.py 在本机重新生成
+index.pkl
+
+# 原始资料 —— 个人笔记内容，不上传
+materials/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS / editor
+.DS_Store

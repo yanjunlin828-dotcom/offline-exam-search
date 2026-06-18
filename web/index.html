@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>离线资料检索</title>
+  <link rel="stylesheet" href="web/highlight-theme.css">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 1rem 1.2rem 3rem;
+      color: #24292e;
+      background: #fff;
+    }
+    h1 { font-size: 1.3rem; margin: 0 0 1rem; color: #333; }
+
+    /* ── search bar ── */
+    #search-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+      margin-bottom: 0.8rem;
+    }
+    #q {
+      flex: 1;
+      min-width: 220px;
+      padding: 0.45rem 0.6rem;
+      font-size: 1rem;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      outline: none;
+    }
+    #q:focus { border-color: #0078d7; box-shadow: 0 0 0 2px #cce4ff; }
+    #search-btn {
+      padding: 0.45rem 1.1rem;
+      font-size: 1rem;
+      cursor: pointer;
+      background: #0078d7;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+    }
+    #search-btn:hover { background: #005fa3; }
+
+    /* ── type toggle ── */
+    #type-toggle { display: flex; gap: 0.3rem; }
+    #type-toggle button {
+      padding: 0.3rem 0.75rem;
+      font-size: 0.88rem;
+      cursor: pointer;
+      border: 1px solid #bbb;
+      background: #f5f5f5;
+      border-radius: 3px;
+      color: #444;
+    }
+    #type-toggle button.active {
+      background: #0078d7;
+      color: #fff;
+      border-color: #0078d7;
+    }
+
+    /* ── status line ── */
+    #status {
+      font-size: 0.88rem;
+      color: #666;
+      margin-bottom: 0.6rem;
+      min-height: 1.2em;
+    }
+
+    /* ── file group ── */
+    .file-group {
+      margin-bottom: 1rem;
+      border: 1px solid #e1e4e8;
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .file-group summary {
+      cursor: pointer;
+      padding: 0.5rem 0.8rem;
+      background: #f6f8fa;
+      font-weight: 600;
+      font-size: 0.92rem;
+      color: #0366d6;
+      user-select: none;
+      list-style: none;
+    }
+    .file-group summary::-webkit-details-marker { display: none; }
+    .file-group summary::before {
+      content: '▾ ';
+      font-size: 0.75rem;
+      color: #888;
+    }
+    .file-group[open] summary::before { content: '▴ '; }
+
+    /* ── result item ── */
+    .result-item {
+      padding: 0.6rem 0.9rem;
+      border-top: 1px solid #e1e4e8;
+    }
+    .result-header {
+      font-size: 0.84rem;
+      color: #586069;
+      margin-bottom: 0.4rem;
+      display: flex;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 0.45rem;
+    }
+    .ctype-badge {
+      display: inline-block;
+      padding: 0.08rem 0.5rem;
+      border-radius: 3px;
+      font-size: 0.76rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .ctype-prose { background: #d4edda; color: #155724; }
+    .ctype-code  { background: #cce5ff; color: #004085; }
+    .heading-path {
+      color: #1a1a1a;
+      font-family: 'Microsoft YaHei', 'PingFang SC', -apple-system, 'Segoe UI', sans-serif;
+    }
+    .score { color: #888; font-size: 0.8rem; }
+
+    /* ── text body ── */
+    .result-text {
+      font-size: 0.9rem;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-x: auto;
+    }
+    .result-text mark {
+      background: #fff176;
+      padding: 0 1px;
+      border-radius: 2px;
+    }
+    .result-text pre { margin: 0; white-space: pre; }
+    .result-text pre code { word-break: normal; }
+
+    .no-result { color: #666; padding: 1rem 0; }
+    .view-btn {
+      display: inline-block;
+      margin-top: 0.4rem;
+      font-size: 0.78rem;
+      color: #0366d6;
+      text-decoration: none;
+      padding: 0.15rem 0.5rem;
+      border: 1px solid #c8e1ff;
+      border-radius: 3px;
+      background: #f1f8ff;
+    }
+    .view-btn:hover { background: #dbedff; }
+  </style>
+</head>
+<body>
+  <h1>离线资料检索</h1>
+
+  <div id="search-bar">
+    <input id="q" type="text" placeholder="输入查询词，回车或点击搜索…" autocomplete="off">
+    <div id="type-toggle">
+      <button data-type="all"   class="active">全部</button>
+      <button data-type="prose">只看概念</button>
+      <button data-type="code" >只看代码</button>
+    </div>
+    <button id="search-btn">搜索</button>
+  </div>
+
+  <div id="status"></div>
+  <div id="results"></div>
+
+  <script src="web/marked.min.js"></script>
+  <script src="web/highlight.min.js"></script>
+  <script>
+  (function () {
+    'use strict';
+
+    var WINDOW_THRESHOLD = 600;   // 超过此长度才做窗口截取
+    var WINDOW_CONTEXT   = 200;   // 关键词前后各展示的字符数
+
+    var activeType    = 'all';
+    var userOverride   = false;   // true = 用户手动点过筛选按钮，意图识别不应再覆盖
+
+    // ── type toggle ──────────────────────────────────────────────────────────
+
+    document.querySelectorAll('#type-toggle button').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        userOverride = true;
+        setActiveType(btn.dataset.type);
+      });
+    });
+
+    function setActiveType(type) {
+      activeType = type;
+      document.querySelectorAll('#type-toggle button').forEach(function (b) {
+        b.classList.toggle('active', b.dataset.type === type);
+      });
+    }
+
+    // ── search triggers ──────────────────────────────────────────────────────
+
+    document.getElementById('search-btn').addEventListener('click', doSearch);
+    document.getElementById('q').addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') doSearch();
+    });
+
+    // ── main search ──────────────────────────────────────────────────────────
+
+    // 用户主动搜索：写入 URL 历史，再执行搜索
+    function doSearch() {
+      var q = document.getElementById('q').value.trim();
+      if (!q) return;
+
+      // 上次搜索若是"意图自动切换"而非用户手动选择，本次重新从"全部"开始判断，
+      // 避免上一条查询残留的 code/prose 过滤继续套用到这条完全不相关的新查询上
+      if (!userOverride) setActiveType('all');
+
+      var params = new URLSearchParams();
+      params.set('q', q);
+      params.set('type', activeType);
+      params.set('manual', userOverride ? '1' : '0');
+      history.pushState(null, '', '?' + params.toString());
+
+      executeSearch(q);
+    }
+
+    // 实际发请求、渲染结果，不操作 history（供 doSearch 和 popstate 共用）
+    function executeSearch(q) {
+      var statusEl  = document.getElementById('status');
+      var resultsEl = document.getElementById('results');
+      statusEl.textContent  = '搜索中…';
+      resultsEl.innerHTML   = '';
+
+      fetch('/search?q=' + encodeURIComponent(q) + '&type=' + activeType)
+        .then(function (resp) {
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          return resp.json();
+        })
+        .then(function (data) {
+          // 根据服务端意图自动切换类型（软偏好）；用户手动选过筛选项时不再覆盖
+          if (!userOverride) setActiveType(data.intent || 'all');
+
+          var intentNote = data.intent
+            ? '（意图：' + data.intent + '）'
+            : '';
+          statusEl.textContent = '共 ' + data.results.length + ' 条结果 ' + intentNote;
+
+          renderResults(data.results, data.query);
+        })
+        .catch(function (err) {
+          statusEl.textContent = '搜索失败：' + err.message;
+        });
+    }
+
+    // ── 浏览器前进 / 后退 ────────────────────────────────────────────────────
+
+    window.addEventListener('popstate', function () {
+      var params = new URLSearchParams(window.location.search);
+      var q    = params.get('q') || '';
+      var type = params.get('type') || 'all';
+
+      userOverride = params.get('manual') === '1';
+      document.getElementById('q').value = q;
+      if (['all', 'prose', 'code'].indexOf(type) !== -1) {
+        setActiveType(type);
+      }
+
+      if (q) {
+        executeSearch(q);
+      } else {
+        document.getElementById('results').innerHTML = '';
+        document.getElementById('status').textContent = '';
+      }
+    });
+
+    // ── 刷新 / 直接访问带参数 URL 时恢复状态 ────────────────────────────────
+
+    (function restoreFromUrl() {
+      var params = new URLSearchParams(window.location.search);
+      var q    = params.get('q') || '';
+      var type = params.get('type') || 'all';
+
+      userOverride = params.get('manual') === '1';
+      if (['all', 'prose', 'code'].indexOf(type) !== -1) {
+        setActiveType(type);
+      }
+      if (q) {
+        document.getElementById('q').value = q;
+        executeSearch(q);
+      }
+    })();
+
+    // ── html helpers ─────────────────────────────────────────────────────────
+
+    function escapeHtml(s) {
+      return s
+        .replace(/&/g,  '&amp;')
+        .replace(/</g,  '&lt;')
+        .replace(/>/g,  '&gt;')
+        .replace(/"/g,  '&quot;');
+    }
+
+    // prose：用 matched_tokens（含别名命中词）逐个找出现位置，合并重叠区间后
+    // 统一转义+包 <mark>（先转义再包，顺序不可颠倒）。
+    // 用合并区间而非逐词 regex 替换，避免中文 bigram 互相重叠时产生破损标签。
+    function highlightProse(text, tokens) {
+      if (!tokens || !tokens.length) return escapeHtml(text);
+
+      var lower  = text.toLowerCase();
+      var ranges = [];
+      tokens.forEach(function (tok) {
+        if (!tok) return;
+        var tlow = tok.toLowerCase();
+        var idx = 0;
+        while (true) {
+          var pos = lower.indexOf(tlow, idx);
+          if (pos === -1) break;
+          ranges.push([pos, pos + tok.length]);
+          idx = pos + 1;
+        }
+      });
+      if (!ranges.length) return escapeHtml(text);
+
+      ranges.sort(function (a, b) { return a[0] - b[0]; });
+      var merged = [ranges[0].slice()];
+      for (var i = 1; i < ranges.length; i++) {
+        var last = merged[merged.length - 1];
+        if (ranges[i][0] <= last[1]) {
+          last[1] = Math.max(last[1], ranges[i][1]);
+        } else {
+          merged.push(ranges[i].slice());
+        }
+      }
+
+      var out = '';
+      var cursor = 0;
+      merged.forEach(function (r) {
+        out += escapeHtml(text.slice(cursor, r[0]));
+        out += '<mark>' + escapeHtml(text.slice(r[0], r[1])) + '</mark>';
+        cursor = r[1];
+      });
+      out += escapeHtml(text.slice(cursor));
+      return out;
+    }
+
+    // code: 交给 hljs 着色，不叠加 <mark>
+    function renderCode(text) {
+      var highlighted;
+      if (window.hljs && typeof window.hljs.highlightAuto === 'function') {
+        highlighted = window.hljs.highlightAuto(text).value;
+      } else {
+        highlighted = escapeHtml(text);
+      }
+      return '<pre><code class="hljs">' + highlighted + '</code></pre>';
+    }
+
+    // ── windowing ────────────────────────────────────────────────────────────
+
+    // 对过长的 prose 文本，找第一个匹配 token 位置并截取前后 WINDOW_CONTEXT 字符
+    function applyWindow(text, tokens) {
+      if (text.length <= WINDOW_THRESHOLD) return text;
+
+      var lower = text.toLowerCase();
+      var firstPos = -1;
+      (tokens || []).forEach(function (tok) {
+        if (!tok) return;
+        var pos = lower.indexOf(tok.toLowerCase());
+        if (pos !== -1 && (firstPos === -1 || pos < firstPos)) firstPos = pos;
+      });
+
+      if (firstPos === -1) {
+        return text.slice(0, WINDOW_THRESHOLD) + '…';
+      }
+
+      var start = Math.max(0, firstPos - WINDOW_CONTEXT);
+      var end   = Math.min(text.length, firstPos + WINDOW_CONTEXT);
+      return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '');
+    }
+
+    // ── render ───────────────────────────────────────────────────────────────
+
+    function renderResults(results, query) {
+      var container = document.getElementById('results');
+      container.innerHTML = '';
+
+      if (!results || results.length === 0) {
+        var msg = document.createElement('p');
+        msg.className   = 'no-result';
+        msg.textContent = '未找到相关结果。';
+        container.appendChild(msg);
+        return;
+      }
+
+      // 按 file 分组（保持结果顺序，第一次出现的文件排前）
+      var groups     = {};
+      var groupOrder = [];
+      results.forEach(function (r) {
+        if (!groups[r.file]) {
+          groups[r.file] = [];
+          groupOrder.push(r.file);
+        }
+        groups[r.file].push(r);
+      });
+
+      groupOrder.forEach(function (file) {
+        var items   = groups[file];
+        var details = document.createElement('details');
+        details.className = 'file-group';
+        details.open      = true;
+
+        // 文件标题行：文件名 + 查看全文按钮（同标签页跳转，返回时自动恢复搜索）
+        // hl 汇总该文件下所有结果的 matched_tokens（含别名命中词），供 viewer 高亮
+        var fileTokens = [];
+        items.forEach(function (it) {
+          (it.matched_tokens || []).forEach(function (t) {
+            if (fileTokens.indexOf(t) === -1) fileTokens.push(t);
+          });
+        });
+        var summary = document.createElement('summary');
+        var viewUrl = '/view?path=' + encodeURIComponent(file)
+                    + '&q=' + encodeURIComponent(query)
+                    + '&hl=' + encodeURIComponent(fileTokens.join(','))
+                    + '&type=' + encodeURIComponent(activeType)
+                    + '&manual=' + (userOverride ? '1' : '0');
+        summary.innerHTML = escapeHtml(file) + '（' + items.length + ' 条）'
+          + '&nbsp;<a class="view-btn" href="' + escapeHtml(viewUrl) + '">查看全文 ↗</a>';
+        details.appendChild(summary);
+
+        items.forEach(function (item) {
+          var div = document.createElement('div');
+          div.className = 'result-item';
+
+          // 标题行：类型徽章 + 章节路径 + 分数
+          var header = document.createElement('div');
+          header.className = 'result-header';
+          var badge   = '<span class="ctype-badge ctype-' + item.ctype + '">'
+                      + escapeHtml(item.ctype) + '</span>';
+          // h 传完整 heading_path（不只是第一段），viewer 端按完整层级匹配才能跳到准确位置
+          var sectionUrl = '/view?path=' + encodeURIComponent(item.file)
+                         + '&q=' + encodeURIComponent(query)
+                         + '&hl=' + encodeURIComponent((item.matched_tokens || []).join(','))
+                         + '&h=' + encodeURIComponent(item.heading_path || '')
+                         + '&type=' + encodeURIComponent(activeType)
+                         + '&manual=' + (userOverride ? '1' : '0');
+          var pathStr = item.heading_path
+            ? '<a class="heading-path" href="' + escapeHtml(sectionUrl) + '">'
+              + escapeHtml(item.heading_path) + '</a>'
+            : '';
+          var scoreStr = '<span class="score">score&nbsp;' + item.score.toFixed(3) + '</span>';
+          header.innerHTML = badge + ' ' + pathStr + ' ' + scoreStr;
+          div.appendChild(header);
+
+          // 正文片段
+          var textDiv = document.createElement('div');
+          textDiv.className = 'result-text';
+          if (item.ctype === 'code') {
+            textDiv.innerHTML = renderCode(item.text);
+          } else {
+            var tokens   = item.matched_tokens || [];
+            var windowed = applyWindow(item.text, tokens);
+            textDiv.innerHTML = highlightProse(windowed, tokens);
+          }
+          div.appendChild(textDiv);
+
+          details.appendChild(div);
+        });
+
+        container.appendChild(details);
+      });
+    }
+
+  })();
+  </script>
+</body>
+</html>

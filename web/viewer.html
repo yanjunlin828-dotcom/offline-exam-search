@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文件查看器</title>
+  <link rel="stylesheet" href="web/katex.min.css">
+  <link rel="stylesheet" href="web/highlight-theme.css">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 1rem 1.4rem 4rem;
+      color: #24292e;
+      line-height: 1.7;
+    }
+    #toolbar {
+      position: sticky;
+      top: 0;
+      background: rgba(255,255,255,0.95);
+      border-bottom: 1px solid #e1e4e8;
+      padding: 0.5rem 0;
+      margin-bottom: 1.2rem;
+      display: flex;
+      align-items: center;
+      gap: 0.8rem;
+      z-index: 100;
+      backdrop-filter: blur(4px);
+    }
+    #back-btn {
+      padding: 0.3rem 0.8rem;
+      font-size: 0.88rem;
+      cursor: pointer;
+      background: #f5f5f5;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      text-decoration: none;
+      color: #333;
+      white-space: nowrap;
+    }
+    #back-btn:hover { background: #e8e8e8; }
+    #file-title {
+      font-size: 0.88rem;
+      color: #0366d6;
+      font-weight: 600;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #loading { color: #888; padding: 2rem 0; }
+    #error   { color: #c00; padding: 1rem; background: #fff0f0; border-radius: 4px; }
+
+    /* ── rendered content ── */
+    #content h1, #content h2, #content h3, #content h4 {
+      border-bottom: 1px solid #e1e4e8;
+      padding-bottom: 0.3em;
+      margin-top: 1.6em;
+    }
+    #content h1 { font-size: 1.6em; }
+    #content h2 { font-size: 1.3em; }
+    #content h3 { font-size: 1.1em; }
+    #content code {
+      background: #f3f4f6;
+      padding: 0.1em 0.3em;
+      border-radius: 3px;
+      font-family: 'Consolas', 'SFMono-Regular', monospace;
+      font-size: 0.87em;
+    }
+    #content pre {
+      background: #f6f8fa;
+      border: 1px solid #e1e4e8;
+      border-radius: 6px;
+      padding: 1em 1.2em;
+      overflow-x: auto;
+    }
+    #content pre code {
+      background: none;
+      padding: 0;
+      font-size: 0.85em;
+    }
+    #content blockquote {
+      border-left: 4px solid #dfe2e5;
+      margin: 0;
+      padding: 0 1em;
+      color: #6a737d;
+    }
+    #content table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1em 0;
+    }
+    #content th, #content td {
+      border: 1px solid #dfe2e5;
+      padding: 0.4em 0.8em;
+    }
+    #content th { background: #f6f8fa; font-weight: 600; }
+    #content img { max-width: 100%; }
+    #content .katex-display { overflow-x: auto; }
+
+    /* ── notebook cells ── */
+    .nb-cell { margin: 0.6em 0; }
+    .nb-code-cell {
+      background: #f6f8fa;
+      border: 1px solid #e1e4e8;
+      border-radius: 6px;
+      padding: 0.8em 1em;
+      overflow-x: auto;
+    }
+    .nb-code-cell pre { margin: 0; background: none; border: none; padding: 0; }
+    .nb-code-cell pre code { font-size: 0.85em; }
+    .nb-output {
+      border-left: 3px solid #d0d7de;
+      margin-top: 0.4em;
+      padding: 0.4em 0.8em;
+      font-size: 0.85em;
+      color: #444;
+      white-space: pre-wrap;
+      font-family: 'Consolas', monospace;
+    }
+
+    mark { background: #fff176; padding: 0 2px; border-radius: 2px; }
+  </style>
+</head>
+<body>
+  <div id="toolbar">
+    <a id="back-btn" href="/">← 返回搜索</a>
+    <span id="file-title"></span>
+  </div>
+  <div id="loading">加载中…</div>
+  <div id="error" style="display:none"></div>
+  <div id="content"></div>
+
+  <script src="web/marked.min.js"></script>
+  <script src="web/katex.min.js"></script>
+  <script src="web/highlight.min.js"></script>
+  <script>
+  (function () {
+    'use strict';
+
+    var params    = new URLSearchParams(location.search);
+    var filePath  = params.get('path') || '';
+    var rawQuery  = params.get('q')    || '';
+    var anchor    = params.get('h')    || '';   // 完整 heading_path，如 "ADMM > 定义"
+    var typeParam = params.get('type') || 'all';
+    var manualParam = params.get('manual') || '0';
+
+    // hl 是后端返回的 matched_tokens（含别名命中词），逐 token 高亮，
+    // 不要求连续整串匹配，从而覆盖"顺序不同/只命中部分字词"的情形；
+    // 旧链接没有 hl 时退化为按空白切分原始查询词。
+    var hlParam       = params.get('hl') || '';
+    var highlightWords = hlParam
+      ? hlParam.split(',').filter(Boolean)
+      : rawQuery.split(/\s+/).filter(Boolean);
+
+    document.getElementById('file-title').textContent = filePath;
+    document.title = filePath || '文件查看器';
+
+    // 返回搜索时带上原查询词和类型，使搜索页能自动恢复结果
+    var backParams = new URLSearchParams();
+    if (rawQuery) backParams.set('q', rawQuery);
+    backParams.set('type', typeParam);
+    backParams.set('manual', manualParam);
+    document.getElementById('back-btn').href = '/?' + backParams.toString();
+
+    if (!filePath) { showError('未指定 path 参数'); return; }
+
+    // 占位符前缀：只含字母数字，不含 markdown 特殊字符，避免被 marked 处理
+    var _MKEY = 'XMATH' + Date.now().toString(36).toUpperCase();
+
+    // ── configure marked (只执行一次) ────────────────────────────────────────
+    var _markedReady = false;
+    function configureMarked() {
+      if (!window.marked || _markedReady) return;
+      _markedReady = true;
+      // marked v5+ 删除了 highlight 选项，必须用 renderer 方式
+      marked.use({
+        gfm: true,
+        breaks: false,
+        renderer: {
+          code: function (code, infostring) {
+            var lang = (infostring || '').split(/\s/)[0];
+            if (window.hljs) {
+              var out = (lang && hljs.getLanguage(lang))
+                ? hljs.highlight(code, { language: lang }).value
+                : hljs.highlightAuto(code).value;
+              return '<pre><code class="hljs">' + out + '</code></pre>';
+            }
+            return '<pre><code>' + escapeHtml(code) + '</code></pre>';
+          }
+        }
+      });
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    // ── math: 解析前保护、解析后还原 ─────────────────────────────────────────
+    // marked 会把 $x_1$ 里的 _ 转成 <em>，破坏 LaTeX；用占位符绕过这个问题
+
+    function protectMath(src) {
+      var blocks = [];
+      // 先处理 $$...$$（多行）
+      src = src.replace(/\$\$([\s\S]*?)\$\$/g, function (_, tex) {
+        return _MKEY + (blocks.push({ tex: tex, display: true }) - 1) + 'E';
+      });
+      // \[...\]（多行）
+      src = src.replace(/\\\[([\s\S]*?)\\\]/g, function (_, tex) {
+        return _MKEY + (blocks.push({ tex: tex, display: true }) - 1) + 'E';
+      });
+      // \(...\)（行内）
+      src = src.replace(/\\\(([\s\S]*?)\\\)/g, function (_, tex) {
+        return _MKEY + (blocks.push({ tex: tex, display: false }) - 1) + 'E';
+      });
+      // $...$（行内，不跨行）
+      src = src.replace(/\$([^\n$]+?)\$/g, function (_, tex) {
+        return _MKEY + (blocks.push({ tex: tex, display: false }) - 1) + 'E';
+      });
+      return { src: src, blocks: blocks };
+    }
+
+    function restoreMath(html, blocks) {
+      return html.replace(new RegExp(_MKEY + '(\\d+)E', 'g'), function (_, i) {
+        var b = blocks[+i];
+        if (!window.katex) {
+          return escapeHtml(b.display ? '$$' + b.tex + '$$' : '$' + b.tex + '$');
+        }
+        try {
+          return katex.renderToString(b.tex, { displayMode: b.display, throwOnError: false });
+        } catch (e) {
+          return '<span style="color:#c00" title="' + escapeHtml(String(e)) + '">'
+               + escapeHtml(b.display ? '$$' + b.tex + '$$' : '$' + b.tex + '$') + '</span>';
+        }
+      });
+    }
+
+    // ── highlight query terms ────────────────────────────────────────────────
+
+    function highlightTerms(el, words) {
+      if (!words || !words.length) return;
+      walkText(el, function (node) {
+        var text = node.nodeValue;
+        var lower = text.toLowerCase();
+        var changed = false;
+        words.forEach(function (w) {
+          if (lower.indexOf(w.toLowerCase()) !== -1) changed = true;
+        });
+        if (!changed) return null;
+        var frag = document.createDocumentFragment();
+        var remaining = text;
+        while (remaining.length > 0) {
+          var bestIdx = -1; var bestWord = '';
+          words.forEach(function (w) {
+            var idx = remaining.toLowerCase().indexOf(w.toLowerCase());
+            if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
+              bestIdx = idx; bestWord = w;
+            }
+          });
+          if (bestIdx === -1) { frag.appendChild(document.createTextNode(remaining)); break; }
+          if (bestIdx > 0) frag.appendChild(document.createTextNode(remaining.slice(0, bestIdx)));
+          var mark = document.createElement('mark');
+          mark.textContent = remaining.slice(bestIdx, bestIdx + bestWord.length);
+          frag.appendChild(mark);
+          remaining = remaining.slice(bestIdx + bestWord.length);
+        }
+        return frag;
+      });
+    }
+
+    function walkText(node, fn) {
+      if (node.nodeType === 3) {
+        var result = fn(node);
+        if (result) node.parentNode.replaceChild(result, node);
+        return;
+      }
+      if (node.nodeName === 'CODE' || node.nodeName === 'PRE' ||
+          node.nodeName === 'SCRIPT' || node.nodeName === 'STYLE') return;
+      Array.from(node.childNodes).forEach(function (c) { walkText(c, fn); });
+    }
+
+    // ── scroll to heading ────────────────────────────────────────────────────
+
+    // 镜像后端 parser.py 的标题栈算法（pop level>=当前级，再 push），
+    // 还原出每个渲染标题的完整 heading_path，才能精确定位到具体小节
+    // （而不是只命中"第一个文字相符的标题"，可能是更靠前的同名大节）。
+    function buildHeadingPathMap() {
+      var headings = document.querySelectorAll(
+        '#content h1,#content h2,#content h3,#content h4,#content h5,#content h6');
+      var stack = [];   // [{level, text}]
+      var map   = [];   // [{path, leaf, el}]
+      headings.forEach(function (el) {
+        var level = parseInt(el.tagName.charAt(1), 10);
+        var text  = el.textContent.trim();
+        while (stack.length && stack[stack.length - 1].level >= level) stack.pop();
+        stack.push({ level: level, text: text });
+        map.push({
+          path: stack.map(function (s) { return s.text; }).join(' > '),
+          leaf: text,
+          el:   el
+        });
+      });
+      return map;
+    }
+
+    function scrollToHeading(headingMap, targetPath) {
+      if (!targetPath) return;
+
+      // 1. 完整路径精确匹配
+      var hit = headingMap.filter(function (h) { return h.path === targetPath; })[0];
+
+      // 2. 路径互为前缀/后缀（容忍标题文字细微差异，如标记符号被 marked 去除）
+      if (!hit) {
+        hit = headingMap.filter(function (h) {
+          return h.path.indexOf(targetPath) !== -1 || targetPath.indexOf(h.path) !== -1;
+        })[0];
+      }
+
+      // 3. 退化为只匹配路径最后一段（原行为，兜底）
+      if (!hit) {
+        var leafTarget = targetPath.split(' > ').pop().toLowerCase();
+        hit = headingMap.filter(function (h) {
+          return h.leaf.toLowerCase().indexOf(leafTarget) !== -1;
+        })[0];
+      }
+
+      if (hit) hit.el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    // ── render markdown ──────────────────────────────────────────────────────
+
+    function renderMarkdown(text) {
+      configureMarked();
+      var math = protectMath(text);
+      var html = window.marked ? marked.parse(math.src) : '<pre>' + escapeHtml(text) + '</pre>';
+      html = restoreMath(html, math.blocks);
+      var el = document.getElementById('content');
+      el.innerHTML = html;
+      highlightTerms(el, highlightWords);
+      var headingMap = buildHeadingPathMap();
+      setTimeout(function () { scrollToHeading(headingMap, anchor); }, 100);
+    }
+
+    // ── render notebook ──────────────────────────────────────────────────────
+
+    function renderNotebook(text) {
+      var nb;
+      try { nb = JSON.parse(text); } catch (e) { showError('无法解析 .ipynb 文件: ' + e); return; }
+
+      var cells = nb.cells
+        || (nb.worksheets && nb.worksheets.length && nb.worksheets[0].cells)
+        || [];
+
+      configureMarked();
+      var el = document.getElementById('content');
+      el.innerHTML = '';
+
+      cells.forEach(function (cell) {
+        var src = Array.isArray(cell.source) ? cell.source.join('') : (cell.source || '');
+        var div = document.createElement('div');
+        div.className = 'nb-cell';
+
+        if (cell.cell_type === 'markdown') {
+          div.className += ' nb-markdown';
+          var math = protectMath(src);
+          var html = window.marked ? marked.parse(math.src) : '<pre>' + escapeHtml(src) + '</pre>';
+          div.innerHTML = restoreMath(html, math.blocks);
+
+        } else if (cell.cell_type === 'code') {
+          div.className += ' nb-code-cell';
+          var highlighted = window.hljs
+            ? hljs.highlightAuto(src).value
+            : escapeHtml(src);
+          var pre = document.createElement('pre');
+          var code = document.createElement('code');
+          code.className = 'hljs';
+          code.innerHTML = highlighted;
+          pre.appendChild(code);
+          div.appendChild(pre);
+
+          var outputs = cell.outputs || [];
+          outputs.forEach(function (out) {
+            var outText = '';
+            if (out.output_type === 'stream') {
+              outText = Array.isArray(out.text) ? out.text.join('') : (out.text || '');
+            } else if (out.output_type === 'execute_result' || out.output_type === 'display_data') {
+              var d = out.data || {};
+              outText = Array.isArray(d['text/plain']) ? d['text/plain'].join('') : (d['text/plain'] || '');
+            }
+            if (outText.trim()) {
+              var outDiv = document.createElement('div');
+              outDiv.className = 'nb-output';
+              outDiv.textContent = outText;
+              div.appendChild(outDiv);
+            }
+          });
+        }
+
+        el.appendChild(div);
+      });
+
+      highlightTerms(el, highlightWords);
+      var headingMap = buildHeadingPathMap();
+      setTimeout(function () { scrollToHeading(headingMap, anchor); }, 100);
+    }
+
+    // ── fetch and dispatch ───────────────────────────────────────────────────
+
+    fetch('/raw?path=' + encodeURIComponent(filePath))
+      .then(function (resp) {
+        if (!resp.ok) throw new Error('HTTP ' + resp.status + ' — 请确认已用 --materials 参数启动服务器');
+        return resp.text();
+      })
+      .then(function (text) {
+        document.getElementById('loading').style.display = 'none';
+        if (filePath.endsWith('.ipynb')) {
+          renderNotebook(text);
+        } else {
+          renderMarkdown(text);
+        }
+      })
+      .catch(function (err) { showError(err.message); });
+
+    function showError(msg) {
+      document.getElementById('loading').style.display = 'none';
+      var el = document.getElementById('error');
+      el.style.display = 'block';
+      el.textContent = '错误：' + msg;
+    }
+
+  })();
+  </script>
+</body>
+</html>
