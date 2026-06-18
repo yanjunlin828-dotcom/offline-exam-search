@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>离线资料检索</title>
   <link rel="stylesheet" href="web/highlight-theme.css">
+  <link rel="stylesheet" href="web/katex.min.css">
   <style>
     *, *::before, *::after { box-sizing: border-box; }
     body {
@@ -83,7 +84,7 @@
       padding: 0.5rem 0.8rem;
       background: #f6f8fa;
       font-weight: 600;
-      font-size: 0.92rem;
+      font-size: 1.1rem;
       color: #0366d6;
       user-select: none;
       list-style: none;
@@ -124,14 +125,20 @@
     .heading-path {
       color: #1a1a1a;
       font-family: 'Microsoft YaHei', 'PingFang SC', -apple-system, 'Segoe UI', sans-serif;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+    .heading-path mark {
+      background: #fff176;
+      padding: 0 1px;
+      border-radius: 2px;
     }
     .score { color: #888; font-size: 0.8rem; }
 
-    /* ── text body ── */
+    /* ── text body（渲染后的 Markdown） ── */
     .result-text {
       font-size: 0.9rem;
       line-height: 1.6;
-      white-space: pre-wrap;
       word-break: break-word;
       overflow-x: auto;
     }
@@ -140,8 +147,58 @@
       padding: 0 1px;
       border-radius: 2px;
     }
-    .result-text pre { margin: 0; white-space: pre; }
-    .result-text pre code { word-break: normal; }
+    .result-text p { margin: 0.3em 0; }
+    .result-text p:first-child { margin-top: 0; }
+    .result-text p:last-child { margin-bottom: 0; }
+    .result-text ul, .result-text ol { margin: 0.3em 0; padding-left: 1.4em; }
+    .result-text pre {
+      margin: 0.3em 0;
+      white-space: pre;
+      background: #f6f8fa;
+      border: 1px solid #e1e4e8;
+      border-radius: 6px;
+      padding: 0.7em 0.9em;
+    }
+    .result-text pre code { word-break: normal; background: none; padding: 0; }
+    .result-text code {
+      background: #f3f4f6;
+      padding: 0.1em 0.3em;
+      border-radius: 3px;
+      font-family: 'Consolas', 'SFMono-Regular', monospace;
+      font-size: 0.87em;
+    }
+    .result-text table { border-collapse: collapse; margin: 0.3em 0; }
+    .result-text th, .result-text td { border: 1px solid #dfe2e5; padding: 0.3em 0.6em; }
+    .result-text th { background: #f6f8fa; font-weight: 600; }
+    .result-text blockquote {
+      border-left: 4px solid #dfe2e5;
+      margin: 0.3em 0;
+      padding: 0 0.9em;
+      color: #6a737d;
+    }
+    .result-text .katex-display { overflow-x: auto; margin: 0.3em 0; }
+
+    /* ── 关键词标黄常驻开关（跨页面共享状态，见 web/markdown-render.js） ── */
+    #highlight-toggle {
+      position: fixed;
+      right: 1.2rem;
+      bottom: 1.2rem;
+      z-index: 999;
+      padding: 0.5rem 1rem;
+      font-size: 0.85rem;
+      cursor: pointer;
+      border: 1px solid #ccc;
+      border-radius: 20px;
+      background: #fff;
+      color: #555;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.15);
+    }
+    #highlight-toggle.active {
+      background: #fff176;
+      border-color: #e6c200;
+      color: #4d3b00;
+    }
+    html.no-highlight mark { background: transparent; color: inherit; }
 
     .no-result { color: #666; padding: 1rem 0; }
     .view-btn {
@@ -174,8 +231,12 @@
   <div id="status"></div>
   <div id="results"></div>
 
+  <button id="highlight-toggle" type="button">关键词标黄</button>
+
   <script src="web/marked.min.js"></script>
+  <script src="web/katex.min.js"></script>
   <script src="web/highlight.min.js"></script>
+  <script src="web/markdown-render.js"></script>
   <script>
   (function () {
     'use strict';
@@ -201,6 +262,10 @@
         b.classList.toggle('active', b.dataset.type === type);
       });
     }
+
+    // ── 关键词标黄开关（状态跨 index.html / viewer.html 共享） ──────────────────
+
+    MDRender.initHighlightToggle(document.getElementById('highlight-toggle'));
 
     // ── search triggers ──────────────────────────────────────────────────────
 
@@ -305,10 +370,32 @@
         .replace(/"/g,  '&quot;');
     }
 
-    // prose：用 matched_tokens（含别名命中词）逐个找出现位置，合并重叠区间后
-    // 统一转义+包 <mark>（先转义再包，顺序不可颠倒）。
-    // 用合并区间而非逐词 regex 替换，避免中文 bigram 互相重叠时产生破损标签。
-    function highlightProse(text, tokens) {
+    // 文件路径展示时去掉最外层目录名（如 "final/8. xxx.md" 只显示 "8. xxx.md"）；
+    // 跳转用的 viewUrl 仍用完整 file 路径，截断只影响这里展示的文字。
+    function displayFileName(file) {
+      var idx = file.indexOf('/');
+      return idx === -1 ? file : file.slice(idx + 1);
+    }
+
+    var HEADING_DISPLAY_MAX_LEVEL = 2;  // 只展示 Markdown 标题级别 <= 此值的部分（# / ##）
+
+    // 按真实 Markdown 标题级别截断 heading_path 展示文字（不是按数组长度）——
+    // 同一篇文档可能从 H1 或直接从 H2 开始，"显示到第二级"必须按 heading_levels
+    // 里记录的实际 # 个数过滤，而不是简单取前 N 段。
+    // levels 缺失（旧索引未重建）时退化为不截断，保证向后兼容不报错。
+    function truncateHeadingPath(path, levels, maxLevel) {
+      if (!path) return path;
+      var parts = path.split(' > ');
+      if (!levels || levels.length !== parts.length) return path;
+
+      var kept = parts.filter(function (_, i) { return levels[i] <= maxLevel; });
+      if (!kept.length) return parts[parts.length - 1];  // 全部更深时至少保留叶子标题
+      return kept.join(' > ');
+    }
+
+    // 标题是纯文本（非 Markdown），命中查询词时直接转义+包 <mark>，
+    // 用合并区间而非逐词替换，避免中文 bigram 互相重叠时产生破损标签。
+    function highlightPlainText(text, tokens) {
       if (!tokens || !tokens.length) return escapeHtml(text);
 
       var lower  = text.toLowerCase();
@@ -348,6 +435,15 @@
       return out;
     }
 
+    // prose：跑一遍 Markdown（含公式）渲染，再在渲染后的 DOM 上按文本节点
+    // 查找并包裹 <mark>——不能在原始文本上先插 <mark> 再渲染，标签会被 marked 破坏。
+    function renderProse(text, tokens) {
+      var div = document.createElement('div');
+      div.innerHTML = MDRender.renderMarkdownToHtml(text);
+      MDRender.highlightTerms(div, tokens);
+      return div.innerHTML;
+    }
+
     // code: 交给 hljs 着色，不叠加 <mark>
     function renderCode(text) {
       var highlighted;
@@ -361,7 +457,9 @@
 
     // ── windowing ────────────────────────────────────────────────────────────
 
-    // 对过长的 prose 文本，找第一个匹配 token 位置并截取前后 WINDOW_CONTEXT 字符
+    // 对过长的 prose 文本，找第一个匹配 token 位置，截取前后 WINDOW_CONTEXT 字符，
+    // 但把截断点snap到最近的换行处——避免切到表格行/列表项/加粗标记中间，
+    // 导致截断后的文本喂给 marked 渲染时格式错乱。
     function applyWindow(text, tokens) {
       if (text.length <= WINDOW_THRESHOLD) return text;
 
@@ -374,12 +472,21 @@
       });
 
       if (firstPos === -1) {
-        return text.slice(0, WINDOW_THRESHOLD) + '…';
+        var cut = text.lastIndexOf('\n', WINDOW_THRESHOLD);
+        if (cut <= 0) cut = WINDOW_THRESHOLD;
+        return text.slice(0, cut) + '\n…';
       }
 
       var start = Math.max(0, firstPos - WINDOW_CONTEXT);
       var end   = Math.min(text.length, firstPos + WINDOW_CONTEXT);
-      return (start > 0 ? '…' : '') + text.slice(start, end) + (end < text.length ? '…' : '');
+
+      var snappedStart = start === 0 ? 0 : (text.lastIndexOf('\n', start) + 1);
+      var newlineAfterEnd = text.indexOf('\n', end);
+      var snappedEnd = newlineAfterEnd === -1 ? text.length : newlineAfterEnd;
+
+      var prefix = snappedStart > 0 ? '…\n' : '';
+      var suffix = snappedEnd < text.length ? '\n…' : '';
+      return prefix + text.slice(snappedStart, snappedEnd) + suffix;
     }
 
     // ── render ───────────────────────────────────────────────────────────────
@@ -427,7 +534,7 @@
                     + '&hl=' + encodeURIComponent(fileTokens.join(','))
                     + '&type=' + encodeURIComponent(activeType)
                     + '&manual=' + (userOverride ? '1' : '0');
-        summary.innerHTML = escapeHtml(file) + '（' + items.length + ' 条）'
+        summary.innerHTML = escapeHtml(displayFileName(file)) + '（' + items.length + ' 条）'
           + '&nbsp;<a class="view-btn" href="' + escapeHtml(viewUrl) + '">查看全文 ↗</a>';
         details.appendChild(summary);
 
@@ -447,9 +554,11 @@
                          + '&h=' + encodeURIComponent(item.heading_path || '')
                          + '&type=' + encodeURIComponent(activeType)
                          + '&manual=' + (userOverride ? '1' : '0');
+          var displayPath = truncateHeadingPath(
+            item.heading_path, item.heading_levels, HEADING_DISPLAY_MAX_LEVEL);
           var pathStr = item.heading_path
             ? '<a class="heading-path" href="' + escapeHtml(sectionUrl) + '">'
-              + escapeHtml(item.heading_path) + '</a>'
+              + highlightPlainText(displayPath, item.matched_tokens || []) + '</a>'
             : '';
           var scoreStr = '<span class="score">score&nbsp;' + item.score.toFixed(3) + '</span>';
           header.innerHTML = badge + ' ' + pathStr + ' ' + scoreStr;
@@ -463,7 +572,7 @@
           } else {
             var tokens   = item.matched_tokens || [];
             var windowed = applyWindow(item.text, tokens);
-            textDiv.innerHTML = highlightProse(windowed, tokens);
+            textDiv.innerHTML = renderProse(windowed, tokens);
           }
           div.appendChild(textDiv);
 

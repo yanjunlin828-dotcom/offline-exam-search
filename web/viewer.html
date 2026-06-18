@@ -121,6 +121,28 @@
     }
 
     mark { background: #fff176; padding: 0 2px; border-radius: 2px; }
+    html.no-highlight mark { background: transparent; color: inherit; }
+
+    /* ── 关键词标黄常驻开关（跨页面共享状态，见 web/markdown-render.js） ── */
+    #highlight-toggle {
+      position: fixed;
+      right: 1.2rem;
+      bottom: 1.2rem;
+      z-index: 999;
+      padding: 0.5rem 1rem;
+      font-size: 0.85rem;
+      cursor: pointer;
+      border: 1px solid #ccc;
+      border-radius: 20px;
+      background: #fff;
+      color: #555;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.15);
+    }
+    #highlight-toggle.active {
+      background: #fff176;
+      border-color: #e6c200;
+      color: #4d3b00;
+    }
   </style>
 </head>
 <body>
@@ -132,9 +154,12 @@
   <div id="error" style="display:none"></div>
   <div id="content"></div>
 
+  <button id="highlight-toggle" type="button">关键词标黄</button>
+
   <script src="web/marked.min.js"></script>
   <script src="web/katex.min.js"></script>
   <script src="web/highlight.min.js"></script>
+  <script src="web/markdown-render.js"></script>
   <script>
   (function () {
     'use strict';
@@ -157,6 +182,8 @@
     document.getElementById('file-title').textContent = filePath;
     document.title = filePath || '文件查看器';
 
+    MDRender.initHighlightToggle(document.getElementById('highlight-toggle'));
+
     // 返回搜索时带上原查询词和类型，使搜索页能自动恢复结果
     var backParams = new URLSearchParams();
     if (rawQuery) backParams.set('q', rawQuery);
@@ -166,119 +193,7 @@
 
     if (!filePath) { showError('未指定 path 参数'); return; }
 
-    // 占位符前缀：只含字母数字，不含 markdown 特殊字符，避免被 marked 处理
-    var _MKEY = 'XMATH' + Date.now().toString(36).toUpperCase();
-
-    // ── configure marked (只执行一次) ────────────────────────────────────────
-    var _markedReady = false;
-    function configureMarked() {
-      if (!window.marked || _markedReady) return;
-      _markedReady = true;
-      // marked v5+ 删除了 highlight 选项，必须用 renderer 方式
-      marked.use({
-        gfm: true,
-        breaks: false,
-        renderer: {
-          code: function (code, infostring) {
-            var lang = (infostring || '').split(/\s/)[0];
-            if (window.hljs) {
-              var out = (lang && hljs.getLanguage(lang))
-                ? hljs.highlight(code, { language: lang }).value
-                : hljs.highlightAuto(code).value;
-              return '<pre><code class="hljs">' + out + '</code></pre>';
-            }
-            return '<pre><code>' + escapeHtml(code) + '</code></pre>';
-          }
-        }
-      });
-    }
-
-    function escapeHtml(s) {
-      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-    }
-
-    // ── math: 解析前保护、解析后还原 ─────────────────────────────────────────
-    // marked 会把 $x_1$ 里的 _ 转成 <em>，破坏 LaTeX；用占位符绕过这个问题
-
-    function protectMath(src) {
-      var blocks = [];
-      // 先处理 $$...$$（多行）
-      src = src.replace(/\$\$([\s\S]*?)\$\$/g, function (_, tex) {
-        return _MKEY + (blocks.push({ tex: tex, display: true }) - 1) + 'E';
-      });
-      // \[...\]（多行）
-      src = src.replace(/\\\[([\s\S]*?)\\\]/g, function (_, tex) {
-        return _MKEY + (blocks.push({ tex: tex, display: true }) - 1) + 'E';
-      });
-      // \(...\)（行内）
-      src = src.replace(/\\\(([\s\S]*?)\\\)/g, function (_, tex) {
-        return _MKEY + (blocks.push({ tex: tex, display: false }) - 1) + 'E';
-      });
-      // $...$（行内，不跨行）
-      src = src.replace(/\$([^\n$]+?)\$/g, function (_, tex) {
-        return _MKEY + (blocks.push({ tex: tex, display: false }) - 1) + 'E';
-      });
-      return { src: src, blocks: blocks };
-    }
-
-    function restoreMath(html, blocks) {
-      return html.replace(new RegExp(_MKEY + '(\\d+)E', 'g'), function (_, i) {
-        var b = blocks[+i];
-        if (!window.katex) {
-          return escapeHtml(b.display ? '$$' + b.tex + '$$' : '$' + b.tex + '$');
-        }
-        try {
-          return katex.renderToString(b.tex, { displayMode: b.display, throwOnError: false });
-        } catch (e) {
-          return '<span style="color:#c00" title="' + escapeHtml(String(e)) + '">'
-               + escapeHtml(b.display ? '$$' + b.tex + '$$' : '$' + b.tex + '$') + '</span>';
-        }
-      });
-    }
-
-    // ── highlight query terms ────────────────────────────────────────────────
-
-    function highlightTerms(el, words) {
-      if (!words || !words.length) return;
-      walkText(el, function (node) {
-        var text = node.nodeValue;
-        var lower = text.toLowerCase();
-        var changed = false;
-        words.forEach(function (w) {
-          if (lower.indexOf(w.toLowerCase()) !== -1) changed = true;
-        });
-        if (!changed) return null;
-        var frag = document.createDocumentFragment();
-        var remaining = text;
-        while (remaining.length > 0) {
-          var bestIdx = -1; var bestWord = '';
-          words.forEach(function (w) {
-            var idx = remaining.toLowerCase().indexOf(w.toLowerCase());
-            if (idx !== -1 && (bestIdx === -1 || idx < bestIdx)) {
-              bestIdx = idx; bestWord = w;
-            }
-          });
-          if (bestIdx === -1) { frag.appendChild(document.createTextNode(remaining)); break; }
-          if (bestIdx > 0) frag.appendChild(document.createTextNode(remaining.slice(0, bestIdx)));
-          var mark = document.createElement('mark');
-          mark.textContent = remaining.slice(bestIdx, bestIdx + bestWord.length);
-          frag.appendChild(mark);
-          remaining = remaining.slice(bestIdx + bestWord.length);
-        }
-        return frag;
-      });
-    }
-
-    function walkText(node, fn) {
-      if (node.nodeType === 3) {
-        var result = fn(node);
-        if (result) node.parentNode.replaceChild(result, node);
-        return;
-      }
-      if (node.nodeName === 'CODE' || node.nodeName === 'PRE' ||
-          node.nodeName === 'SCRIPT' || node.nodeName === 'STYLE') return;
-      Array.from(node.childNodes).forEach(function (c) { walkText(c, fn); });
-    }
+    var escapeHtml = MDRender.escapeHtml;
 
     // ── scroll to heading ────────────────────────────────────────────────────
 
@@ -331,13 +246,9 @@
     // ── render markdown ──────────────────────────────────────────────────────
 
     function renderMarkdown(text) {
-      configureMarked();
-      var math = protectMath(text);
-      var html = window.marked ? marked.parse(math.src) : '<pre>' + escapeHtml(text) + '</pre>';
-      html = restoreMath(html, math.blocks);
       var el = document.getElementById('content');
-      el.innerHTML = html;
-      highlightTerms(el, highlightWords);
+      el.innerHTML = MDRender.renderMarkdownToHtml(text);
+      MDRender.highlightTerms(el, highlightWords);
       var headingMap = buildHeadingPathMap();
       setTimeout(function () { scrollToHeading(headingMap, anchor); }, 100);
     }
@@ -352,7 +263,6 @@
         || (nb.worksheets && nb.worksheets.length && nb.worksheets[0].cells)
         || [];
 
-      configureMarked();
       var el = document.getElementById('content');
       el.innerHTML = '';
 
@@ -363,9 +273,7 @@
 
         if (cell.cell_type === 'markdown') {
           div.className += ' nb-markdown';
-          var math = protectMath(src);
-          var html = window.marked ? marked.parse(math.src) : '<pre>' + escapeHtml(src) + '</pre>';
-          div.innerHTML = restoreMath(html, math.blocks);
+          div.innerHTML = MDRender.renderMarkdownToHtml(src);
 
         } else if (cell.cell_type === 'code') {
           div.className += ' nb-code-cell';
@@ -400,7 +308,7 @@
         el.appendChild(div);
       });
 
-      highlightTerms(el, highlightWords);
+      MDRender.highlightTerms(el, highlightWords);
       var headingMap = buildHeadingPathMap();
       setTimeout(function () { scrollToHeading(headingMap, anchor); }, 100);
     }
