@@ -34,6 +34,7 @@ _INDEX        = None
 _ALIASES      = None
 _WEB_DIR      = None
 _MATERIALS_DIR = None   # 原始资料目录，用于 /raw 路由
+_FILES        = None    # 索引内全部源文件清单（启动时算一次），供 /api/files 用
 
 MIME_TYPES = {
     '.html':  'text/html; charset=utf-8',
@@ -47,6 +48,40 @@ MIME_TYPES = {
     '.ttf':   'font/ttf',
 }
 DEFAULT_MIME = 'application/octet-stream'
+
+
+def _build_file_list(index):
+    """从索引 chunks 聚合出源文件清单（路径 + 该文件的 chunk 数），按路径排序。
+
+    Args:
+        index: pickle.load 得到的索引 dict。
+
+    Returns:
+        list[dict]，每条含 file（相对路径）/ chunks（块数）。
+    """
+    counts = {}
+    for chunk in index['chunks']:
+        counts[chunk['file']] = counts.get(chunk['file'], 0) + 1
+    return [{'file': f, 'chunks': counts[f]} for f in sorted(counts)]
+
+
+def _parse_allowed_files(params):
+    """解析 /search 的 files 查询参数，转换为 ranking.search 的 allowed_files。
+
+    缺省（未传 files 参数）→ None（不限制，全部文件参与，向后兼容）；
+    传了 files 参数（哪怕是空字符串）→ 按逗号切分为 frozenset（可能是空集，
+    表示用户在前端明确取消勾选了所有文件，应返回空结果）。
+
+    Args:
+        params: parse_qs(..., keep_blank_values=True) 得到的参数字典。
+
+    Returns:
+        None 或 frozenset[str]。
+    """
+    if 'files' not in params:
+        return None
+    raw = params['files'][0]
+    return frozenset(f for f in raw.split(',') if f)
 
 
 class _ReuseServer(ThreadingHTTPServer):
@@ -66,6 +101,8 @@ class SearchHandler(BaseHTTPRequestHandler):
             self._serve_index()
         elif path == '/search':
             self._serve_search(parsed.query)
+        elif path == '/api/files':
+            self._serve_files()
         elif path == '/raw':
             self._serve_raw(parsed.query)
         elif path == '/view':
@@ -111,18 +148,20 @@ class SearchHandler(BaseHTTPRequestHandler):
         self._send_file(requested_real, mime)
 
     def _serve_search(self, query_string):
-        params = parse_qs(query_string)
+        params = parse_qs(query_string, keep_blank_values=True)
         q           = params.get('q',    [''])[0].strip()
         type_filter = params.get('type', ['all'])[0]
         if type_filter not in ('all', 'prose', 'code'):
             type_filter = 'all'
+        allowed_files = _parse_allowed_files(params)
 
         if not q:
             results_list, intent = [], None
         else:
             try:
                 results_list, intent = ranking.search(
-                    _INDEX, q, _ALIASES, type_filter=type_filter
+                    _INDEX, q, _ALIASES, type_filter=type_filter,
+                    allowed_files=allowed_files,
                 )
             except Exception as exc:
                 print(f"[错误] 检索失败: {exc}")
@@ -133,6 +172,15 @@ class SearchHandler(BaseHTTPRequestHandler):
             ensure_ascii=False
         ).encode('utf-8')
 
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_files(self):
+        """GET /api/files → 索引内全部源文件清单（前端"资料范围"面板用）。"""
+        body = json.dumps({'files': _FILES}, ensure_ascii=False).encode('utf-8')
         self.send_response(200)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
@@ -193,7 +241,7 @@ class SearchHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global _INDEX, _ALIASES, _WEB_DIR, _MATERIALS_DIR
+    global _INDEX, _ALIASES, _WEB_DIR, _MATERIALS_DIR, _FILES
 
     ap = argparse.ArgumentParser(description='离线检索本地 Web 服务器')
     ap.add_argument('--index',     default='index.pkl',
@@ -212,6 +260,7 @@ def main():
 
     with open(args.index, 'rb') as f:
         _INDEX = pickle.load(f)
+    _FILES = _build_file_list(_INDEX)
 
     _ALIASES = ranking.load_aliases(args.aliases)
     _WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
@@ -222,7 +271,7 @@ def main():
     else:
         print("资料目录：未指定（查看全文功能不可用，加 --materials <dir> 启用）")
 
-    print(f"索引：{args.index}（{_INDEX['N']} 块，{len(_INDEX['inverted'])} token 种类）")
+    print(f"索引：{args.index}（{_INDEX['N']} 块，{len(_INDEX['inverted'])} token 种类，{len(_FILES)} 个源文件）")
     print(f"别名组：{len(_ALIASES)} 组")
     print(f"服务已启动 → http://127.0.0.1:{args.port}/")
     print("Ctrl+C 退出")

@@ -167,6 +167,27 @@ def test_search_type_filter_code():
         assert r['ctype'] == 'code', f"过滤 code 时出现 {r['ctype']!r}"
 
 
+def test_search_allowed_files_restricts_results():
+    """allowed_files 限定后，结果只来自指定文件（验证'资料范围'过滤）。"""
+    results, intent = search(_INDEX, 'admm', aliases=None, allowed_files={'a.md'})
+    files = {r['file'] for r in results}
+    assert files, "期望有结果"
+    assert files <= {'a.md'}, f"应只命中 a.md，实际 {files}"
+
+
+def test_search_allowed_files_empty_set_returns_empty():
+    """allowed_files 为空集合（用户取消勾选全部文件）时返回空结果。"""
+    results, intent = search(_INDEX, 'admm', aliases=None, allowed_files=frozenset())
+    assert results == [], f"期望空列表，实际 {results}"
+
+
+def test_search_allowed_files_none_means_unrestricted():
+    """allowed_files=None（默认）与未传该参数行为一致，不限制文件范围。"""
+    r_default, _ = search(_INDEX, 'admm', aliases=None)
+    r_explicit_none, _ = search(_INDEX, 'admm', aliases=None, allowed_files=None)
+    assert [r['file'] for r in r_default] == [r['file'] for r in r_explicit_none]
+
+
 def test_search_topk_respected():
     """topk 参数生效：返回数量不超过 topk。"""
     results, intent = search(_INDEX, 'admm', aliases=None, topk=1)
@@ -517,6 +538,9 @@ if __name__ == '__main__':
         test_search_special_chars_no_exception,
         test_search_type_filter_prose,
         test_search_type_filter_code,
+        test_search_allowed_files_restricts_results,
+        test_search_allowed_files_empty_set_returns_empty,
+        test_search_allowed_files_none_means_unrestricted,
         test_search_topk_respected,
         test_search_empty_query_returns_empty,
         test_search_sorted_by_score_descending,

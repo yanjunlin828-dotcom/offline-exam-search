@@ -205,7 +205,8 @@ def _apply_cliff_cutoff(results, drop_ratio=CUTOFF_DROP_RATIO):
     return kept
 
 
-def search(index, query, aliases, type_filter="all", topk=CUTOFF_DEFAULT_TOPK):
+def search(index, query, aliases, type_filter="all", topk=CUTOFF_DEFAULT_TOPK,
+           allowed_files=None):
     """检索并按相关度返回结果（先按 topk 截顶，再做断崖检测进一步收窄）。
 
     打分 = (weighted_bm25(score_tokens) + W_POS*(1/(1+pos)) + W_TYPE*(意图匹配))
@@ -222,6 +223,11 @@ def search(index, query, aliases, type_filter="all", topk=CUTOFF_DEFAULT_TOPK):
         aliases: 别名组列表（load_aliases 结果；None 或 [] 则跳过别名展开）。
         type_filter: "all" | "prose" | "code"。
         topk: 断崖检测窗口的硬上限（最多返回这么多条，断崖检测可能进一步收窄）。
+        allowed_files: None 或 set/frozenset[str] —— 限定参与检索的源文件
+            （chunk['file']，即相对路径）集合。None 表示不限制（默认，向后兼容）；
+            传入空集合表示用户明确不选任何文件，应返回空结果。
+            注意：IDF/avgdl 仍按整份索引（构建时的全量语料）计算，不会因为
+            限定子集而重新统计——这是有意为之，子集排序权重的基准不变。
 
     Returns:
         (list[dict], intent)：
@@ -277,6 +283,9 @@ def search(index, query, aliases, type_filter="all", topk=CUTOFF_DEFAULT_TOPK):
     if not candidate_ids:
         return [], intent
 
+    if allowed_files is not None and not allowed_files:
+        return [], intent
+
     # 5. 打分
     chunks = index['chunks']
     n_topics = len(topic_tokens)
@@ -286,6 +295,9 @@ def search(index, query, aliases, type_filter="all", topk=CUTOFF_DEFAULT_TOPK):
         chunk = chunks[chunk_id]
 
         if type_filter in ('prose', 'code') and chunk['ctype'] != type_filter:
+            continue
+
+        if allowed_files is not None and chunk['file'] not in allowed_files:
             continue
 
         # score_tokens = topic_tokens + 完整命中的别名短语 token（去重）
